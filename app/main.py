@@ -132,7 +132,16 @@ from .schemas import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.init_db()
+    # 每次启动尝试都先以"未就绪"开始：迁移或校验失败时，
+    # 绝不能残留上一次成功启动的 db_ready=True（探针误判放行业务流量）。
+    app.state.db_ready = False
+    app.state.schema_version = None
+    # 版本化迁移：预检（非破坏性）→ 单个写事务内按编号执行未完成迁移 →
+    # 结构校验。任一步失败或校验不通过都会抛 MigrationError，启动中止，
+    # 服务不会进入可接受业务请求的状态（无任何路由得到服务）。
+    result = db.init_db()
+    app.state.db_ready = True
+    app.state.schema_version = result.version
     yield
 
 
@@ -321,7 +330,13 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    # 迁移未完成 / 校验失败时 lifespan 已中止启动；此处为防御性兜底：
+    # 任何异常启动路径下健康检查都不能报 ok，探针不应把实例放入流量。
+    if not getattr(app.state, "db_ready", False):
+        return JSONResponse(
+            status_code=503, content={"status": "unavailable", "reason": "schema 迁移未完成"}
+        )
+    return {"status": "ok", "schema_version": getattr(app.state, "schema_version", None)}
 
 
 # ---------------------------------------------------------------------------
@@ -920,7 +935,8 @@ def confirm_annotation(
     目标记录读取、状态 / 顺延 / 既有确认检查、候选校验与确认写入在同一个
     BEGIN IMMEDIATE 写事务中完成：并发确认同一歧义记录时，后到者在取得
     写锁后重新校验，稳定返回 409；confirmations.location_id 上的唯一索引
-    （见 db.SCHEMA）在 SQLite 层兜底，保证每个 location 至多一条确认——
+    （迁移 2 建立，见 app.migrations）在 SQLite 层兜底，保证每个 location
+    至多一条确认——
     不会覆盖首条确认，也不会留下重复行。
     """
     with db.transaction(con):

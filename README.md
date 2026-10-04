@@ -98,10 +98,123 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000   # 数据库默认写入 ./data/app.db
-pytest                                       # 运行测试（279 个用例）
+pytest                                       # 运行测试（316 个用例）
 ```
 
 可用环境变量 `DB_PATH` 指定 SQLite 文件路径。
+
+## 数据库版本化迁移与升级
+
+SQLite schema 的建立与升级采用**版本化、可审计迁移**（实现见 `app/migrations.py`），
+不再使用整块建表脚本。服务启动时（FastAPI lifespan，在接受任何业务请求之前）：
+
+1. **非破坏性预检**（只读）：`PRAGMA integrity_check` 完整性检查；
+   `confirmations` 历史重复检查；旧索引缺失、`app_meta` 游标密钥行缺失登记。
+   - 发现同一 `location_id` 多条确认等**无法自动修复**的问题时，**拒绝启动**，
+     错误信息逐条列出 `location_id` 与确认行 ID，绝不静默删改。
+2. 在**单个 `BEGIN IMMEDIATE` 写事务**中读取当前 schema 版本，按编号顺序执行
+   所有未完成迁移；每步先建 SAVEPOINT：
+   - 成功：同事务内向 `schema_migrations` 追加一条 `applied` 审计行
+     （编号、名称、状态、起止时间戳）；
+   - 失败：**回滚该步**、同事务追加带错误文本的 `failed` 审计行后提交，
+     随后中止启动。
+3. 全部完成后、提交前做**结构校验**：必需表 / 唯一索引齐全、旧非唯一索引
+   已移除、游标密钥行存在、无重复确认、版本连续、`PRAGMA foreign_key_check`
+   无违例；任一不满足则**整体回滚**并拒绝启动。
+
+迁移未完成或校验失败时，进程退出，**不接受任何业务请求**；
+`GET /health` 在实例未就绪时返回 `503 {"status":"unavailable"}`。
+
+### 审计表 schema_migrations
+
+只追加（UPDATE/DELETE 被触发器拒绝），每次尝试都永久留痕：
+
+| 列 | 含义 |
+|---|---|
+| `version` | 迁移编号（1 起，严格递增） |
+| `name` | 迁移名（如 `confirmations_unique_index`） |
+| `status` | `applied` 或 `failed`（每版本至多一条 `applied`，失败可多条） |
+| `error` | 失败时的错误类型与文本（成功为 NULL） |
+| `started_at` / `finished_at` | UTC 时间戳 |
+
+当前内置迁移：
+
+| 版本 | 名称 | 内容 |
+|---|---|---|
+| 1 | `initial_schema` | 建立初始表与索引（旧库仅补齐缺失对象，全部只追加数据原样保留） |
+| 2 | `confirmations_unique_index` | 预检重复确认后，把非唯一索引 `idx_confirm_loc` 替换为唯一索引 `idx_confirm_loc_unique` |
+| 3 | `app_meta_cursor_secret` | 建立 `app_meta` 并补齐检索游标 HMAC 密钥（`INSERT OR IGNORE`，只生成一次） |
+
+### 升级（已部署旧库 / 新库，命令完全不变）
+
+新库与旧库都使用相同的 Compose 命令、端口（8000）与 API，无需额外操作：
+
+```bash
+docker compose up --build        # 数据卷 annotation-data 中的旧库自动平滑升级
+docker compose logs api          # 查看 "迁移 N（…）完成 / schema 已迁移至版本 N"
+```
+
+查看迁移结果与审计记录：
+
+```bash
+docker compose exec api python - <<'PY'
+import sqlite3
+con = sqlite3.connect("/data/app.db")
+for row in con.execute(
+    "SELECT version, name, status, error, started_at FROM schema_migrations ORDER BY id"
+):
+    print(row)
+PY
+```
+
+**升级前建议备份**（复制出卷内文件后再启动新版本）：
+
+```bash
+docker run --rm -v annotation-data:/data -v "$PWD":/backup alpine \
+    cp /data/app.db /backup/app.db.before-upgrade
+```
+
+### 失败恢复示例
+
+**情形一：历史重复确认（预检拒绝，数据原样保留）。** 日志示例：
+
+```
+schema 预检失败，拒绝启动：confirmations 表存在历史重复确认…：
+location_id=42（确认行 ID：107,108）
+```
+
+核对后保留正确的一条（示例保留行 ID 107，删除重复行 108），重新启动即可——
+迁移重试幂等，会从失败步继续，已 applied 的版本不会重跑：
+
+```bash
+docker compose exec api python - <<'PY'
+import sqlite3
+con = sqlite3.connect("/data/app.db", isolation_level=None)
+con.execute("DELETE FROM confirmations WHERE id = 108")   # 确认后删除重复行
+con.execute('PRAGMA foreign_key_check')                  # 可选：再次自检
+con.close()
+PY
+docker compose restart api
+```
+
+**情形二：某一步迁移失败（该步已回滚，审计留 failed 行）。**
+日志会给出编号、名称与错误文本；修复根因（磁盘空间、文件权限等）后
+`docker compose restart api` 即可幂等重试。审计中同一版本会看到
+`failed` 在前、修复后 `applied` 在后，历史可追溯。
+
+**情形三：结构校验失败（整个写事务回滚，库回到启动前状态）。**
+从备份恢复后重新启动：
+
+```bash
+docker run --rm -v annotation-data:/data -v "$PWD":/backup alpine \
+    sh -c 'cp /backup/app.db.before-upgrade /data/app.db && rm -f /data/app.db-wal /data/app.db-shm'
+docker compose up --build
+```
+
+> 所有迁移语句均为 `IF NOT EXISTS` / `INSERT OR IGNORE` / `DROP IF EXISTS`
+> 的非破坏写法，versions、annotations、locations、confirmations、dependencies、
+> completions、policy_revisions、review_packages、release_candidates 等
+> 只追加业务数据不会被删除或覆盖；游标密钥生成一次后跨重启不变。
 
 ## 核心概念
 
@@ -1762,12 +1875,14 @@ app/
   review_packages.py # 离线审阅包：同读事务冻结快照/自动收录传递前置、离线决定整批校验、回传冲突检测与同写事务按依赖顺序应用、首次结果幂等重放
   release_candidates.py # 发布候选：同读事务固定版本/策略修订/门禁解释树/审阅状态/六类事件水位，初始门禁不过不落候选；确认时同写事务重读水位与门禁，冲突可定位且不改候选，水位未变且门禁通过才追加一次 released、重复确认幂等重放
   search.py     # 版本范围字面子串检索：码点字面匹配（保留重叠）、前后文片段、相交批注生效状态（确认范围优先）、四表快照水位与 HMAC 签名续页/续拉游标（纯函数 + 游标编解码）
-  db.py         # SQLite 连接、建表、读写事务
+  db.py         # SQLite 连接（WAL/checkpoint）、读写事务、init_db 启动入口
+  migrations.py # 版本化可审计迁移：非破坏性预检、单写事务顺序迁移、schema_migrations 只追加审计、迁移后结构校验
   schemas.py    # 请求体模型（含门禁策略、归档结构、核验请求、批量偏移换算与审阅包模型）
 tests/
   test_matching.py  # 匹配算法单元测试
   test_diffing.py   # 编辑片段/投影/分类单元测试
   test_api.py       # 端到端流程测试（迁移/歧义/顺延/确认/对比）
+  test_migrations.py # 版本化迁移测试（新库/旧库/缺表缺索引/重复拒绝/单步回滚重试/校验回滚/审计只追加/服务门禁）
   test_impact.py    # 改动影响分析接口端到端测试
   test_review.py    # 审阅依赖编排测试（依赖校验/环检测/审阅计划/完成记录）
   test_gate.py      # 发布门禁测试（策略语法拒绝/修订只追加/同事务快照评估/不短路解释树/稳定性）

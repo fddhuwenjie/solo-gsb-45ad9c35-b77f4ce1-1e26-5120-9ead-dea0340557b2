@@ -1,16 +1,17 @@
-"""confirmations.location_id 唯一约束的建库 / 迁移回归。
+"""confirmations.location_id 唯一约束（迁移 2）的建库 / 迁移回归。
 
-- 全新库：init_db 直接建立唯一索引，重复插入被 SQLite 拒绝；
-- 无历史重复的既有库（旧 schema，只有非唯一索引 idx_confirm_loc）：
-  init_db 平滑建立唯一约束，已有确认行原样保留；
-- 含历史重复的既有库：init_db 不静默删改，抛出可定位到
-  location_id 与确认行 ID 的错误，重复行原样保留。
+- 全新库：init_db 顺序执行迁移 1..3，直接建立唯一索引，重复插入被拒绝；
+- 无历史重复的旧版库（只有非唯一索引 idx_confirm_loc）：
+  迁移 1 补齐其余对象、迁移 2 平滑建立唯一约束，已有确认行原样保留；
+- 含历史重复的旧版库：迁移 2 预检不静默删改，抛出可定位到
+  location_id 与确认行 ID 的错误，重复行原样保留，服务拒绝启动。
 """
 import sqlite3
 
 import pytest
 
 from app import db
+from app import migrations
 
 
 def _use_db(tmp_path, monkeypatch):
@@ -20,12 +21,15 @@ def _use_db(tmp_path, monkeypatch):
 
 
 def _build_old_style_db(path):
-    """模拟旧版库：confirmations 上只有非唯一索引 idx_confirm_loc，无唯一约束。"""
-    con = sqlite3.connect(path)
+    """模拟旧版库：迁移 1 的初始结构（含旧非唯一索引 idx_confirm_loc）。
+
+    自动提交连接，确保结构落盘（模拟真实已部署旧库）。
+    """
+    con = sqlite3.connect(path, isolation_level=None)
     try:
-        con.executescript(db.SCHEMA)
-        con.execute("DROP INDEX idx_confirm_loc_unique")
-        con.execute("CREATE INDEX idx_confirm_loc ON confirmations (location_id)")
+        for statement in migrations.DDL_V1:
+            con.execute(statement)
+        con.execute("DROP TABLE IF EXISTS app_meta")
     finally:
         con.close()
 
@@ -139,7 +143,7 @@ def test_existing_db_with_duplicates_refuses_and_reports(tmp_path, monkeypatch):
     finally:
         con.close()
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(migrations.MigrationError) as excinfo:
         db.init_db()
     message = str(excinfo.value)
     assert f"location_id={location_id}" in message
@@ -155,5 +159,12 @@ def test_existing_db_with_duplicates_refuses_and_reports(tmp_path, monkeypatch):
         ).fetchall()
         assert [r["id"] for r in rows] == [first_id, second_id]
         assert "idx_confirm_loc_unique" not in _indexes(con)
+
+        # 预检失败同样可审计：v2 留 failed 行（错误文本可定位），无任何 applied
+        audit = migrations.read_audit(con)
+        assert not [r for r in audit if r["status"] == "applied"]
+        failed = [r for r in audit if r["status"] == "failed"]
+        assert len(failed) == 1 and failed[0]["version"] == 2
+        assert f"location_id={location_id}" in failed[0]["error"]
     finally:
         con.close()
