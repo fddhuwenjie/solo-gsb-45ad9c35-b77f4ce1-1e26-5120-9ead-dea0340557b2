@@ -89,7 +89,8 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 启动后：
 
 - 交互式 API 文档（Swagger UI）：http://localhost:8000/docs
-- 健康检查：http://localhost:8000/health
+- 健康检查：http://localhost:8000/health（存活探针，始终可答）
+- 就绪检查：http://localhost:8000/readyz（迁移未完成或校验失败时 503，附已应用编号与失败明细）
 
 数据通过 Compose 命名卷 `annotation-data` 持久化（SQLite 文件 `/data/app.db`）。
 
@@ -98,10 +99,141 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000   # 数据库默认写入 ./data/app.db
-pytest                                       # 运行测试（279 个用例）
+pytest                                       # 运行测试（315 个用例）
 ```
 
 可用环境变量 `DB_PATH` 指定 SQLite 文件路径。
+
+## 数据库版本化迁移（可审计）
+
+SQLite 初始化是**版本化、可审计**的流程，而不是无条件 `CREATE TABLE IF NOT EXISTS`：
+
+- 审计表 `schema_migrations` 只追加记录每个迁移的**编号、名称、状态
+  （`applied` / `failed`）、错误信息与时间**；同一编号允许多行（旧的
+  `failed` 行保留，重试成功后再追加 `applied`），审计链不覆盖、不删除。
+  当前版本同时镜像到 `PRAGMA user_version`。
+- 启动时在**单个写事务**（`BEGIN IMMEDIATE`）内读取已应用编号，按编号顺序
+  执行未完成的迁移；每一步用 `SAVEPOINT` 包裹——**任一步失败只回滚该步**，
+  随后写入带编号与错误堆栈的 `failed` 审计行并提交审计，服务拒绝启动。
+- 全部步骤完成后执行**终态校验**（所有编号已应用、唯一约束 / 索引 /
+  游标密钥齐备、`confirmations` 无重复），任一不满足同样拒绝启动。
+- **迁移未成功或校验失败时，服务不接受任何业务请求**：进程启动失败退出
+  （uvicorn 不监听端口）；运行中探针可见时除 `/health`、`/readyz` 外的
+  业务请求一律 `503 Service Unavailable`（带 `Retry-After: 30`）。
+- 迁移全部幂等：DDL 使用 `CREATE ... IF NOT EXISTS`、旧索引 `DROP INDEX IF
+  EXISTS`、密钥 `INSERT OR IGNORE`；中断或失败后直接重启即可重试，
+  已应用的编号不会重复执行，只追加业务数据不删不改。
+
+当前编号：
+
+| 版本 | 名称 | 内容 |
+| --- | --- | --- |
+| 1 | `initial_schema` | 初始业务表与索引（documents / versions / annotations / locations / confirmations / dependencies / completions / policy_revisions / review_packages） |
+| 2 | `confirmations_location_unique` | 预检通过后以唯一索引 `idx_confirm_loc_unique` 取代旧非唯一索引 `idx_confirm_loc`（同一 location 至多一条确认） |
+| 3 | `release_candidates` | 补齐发布候选表与 `idx_release_candidates_doc` |
+| 4 | `app_meta_cursor_secret` | 建 `app_meta` 并随机生成一次版本范围检索游标的 HMAC 密钥（重启不更换） |
+
+### 旧库兼容与非破坏性预检
+
+无 `schema_migrations` 的已部署旧库会被自动识别：启动时先做**非破坏性
+预检**（只读，不改任何数据），再按各编号的结构证据判断其是否已落地——
+已落地的编号不重复执行，只追加一条 `note='legacy-baseline'` 的 `applied`
+基线审计；未落地的编号正常迁移。全部**只追加业务数据（版本、批注、迁移
+记录、确认、依赖、完成、策略修订、审阅包）原样保留**。
+
+- **`confirmations` 重复确认（致命）**：旧版本没有唯一约束，历史并发确认
+  可能给同一 `location_id` 留下多行。预检会列出每个 `location_id` 与全部
+  确认行 ID 并**拒绝启动**，不静默删改任何数据，也不建立唯一索引。
+- **旧索引缺失 / `release_candidates` 缺表 / `app_meta` 缺行或缺表
+  （可安全升级）**：仅在启动日志中告警，由对应编号迁移幂等补齐，
+  业务数据不受影响。
+
+探针与审计查询：
+
+```bash
+curl -s http://localhost:8000/health            # 存活：始终 200
+curl -s http://localhost:8000/readyz            # 就绪：版本、已应用编号、failed 明细
+# → {"ready":true,"schema_version":4,"applied_versions":[1,2,3,4],"failed":[],...}
+
+# 查看完整审计链（容器内 / 挂载卷上的 app.db）
+docker compose exec api python -c "
+from app import db
+con = db.connect()
+for r in con.execute('SELECT id,version,status,note,error FROM schema_migrations ORDER BY id'):
+    print(tuple(r))
+"
+```
+
+### 升级步骤（新库 / 旧库使用相同命令）
+
+不需要手动迁移命令；镜像启动即迁移，Compose 命令、端口与 API 完全不变：
+
+```bash
+# 升级前建议先备份卷中的库（业务低峰；SQLite 在线一致性备份）
+docker compose exec api python -c "
+import sqlite3
+src = sqlite3.connect('/data/app.db')
+dst = sqlite3.connect('/data/app.db.bak')
+src.backup(dst); dst.close(); src.close()
+print('backed up to /data/app.db.bak')
+"
+
+docker compose pull            # 或 docker compose build
+docker compose up -d
+docker compose logs -f api     # 看到 “数据库迁移完成：version=4 ...” 即完成
+curl -s http://localhost:8000/readyz | grep -q '\"ready\":true' && echo READY
+```
+
+全新部署：新库在首次启动时按 1→4 顺序建库并记录全部 `applied`；
+已有部署：旧库走预检 + 基线补登 + 增量迁移（上述流程）。
+
+### 失败恢复示例
+
+**情形 1：预检报告重复确认（最常见的拒绝启动原因）。** 启动日志与
+`schema_migrations` 中会看到：
+
+```
+迁移 002 ... confirmations 表存在历史重复确认（同一迁移记录多条确认），
+唯一约束未建立，也未删改任何数据；请人工核对并清理以下位置后再启动：
+location_id=42（确认行 ID：107,108）
+```
+
+恢复（服务**不会**自动删除任何确认，需人工决定保留哪一条）：
+
+```bash
+# 1. 停止服务，备份库文件后核对重复内容
+docker compose stop api
+docker compose run --rm --no-deps --entrypoint python api -c "
+import sqlite3
+con = sqlite3.connect('/data/app.db')
+for r in con.execute('''
+  SELECT id, location_id, start, \"end\", note, created_at
+  FROM confirmations WHERE location_id = 42 ORDER BY id'''):
+    print(r)
+"
+
+# 2. 人工确认保留首条（示例；删除范围请按核对结果决定），另一条先导出留档
+docker compose run --rm --no-deps --entrypoint python api -c "
+import sqlite3
+con = sqlite3.connect('/data/app.db', isolation_level=None)
+con.execute('BEGIN IMMEDIATE')
+con.execute('DELETE FROM confirmations WHERE id = 108')   # 仅在人工确认后执行
+con.execute('COMMIT')
+"
+
+# 3. 直接重启：预检重跑 → 002 建唯一索引 → 003/004 继续；幂等
+docker compose up -d
+```
+
+重试成功后，审计中同时保留历史 `failed`（`note='preflight'`）与后续的
+`applied` 行，可完整追溯。
+
+**情形 2：某一步执行失败**（如磁盘满导致建索引失败）。该步经 SAVEPOINT
+回滚、库结构停留在上一个已应用版本，`failed` 行记录编号与错误。修复根因
+（清磁盘 / 修权限）后**直接重启**即可：已应用编号不重跑，失败编号幂等
+重试，成功后在失败行之后追加 `applied`。若需回到升级前状态，恢复启动前
+的备份（`app.db` 连同 `app.db-wal`、`app.db-shm`，或上面的在线备份）后再
+启动旧镜像即可，旧镜像不依赖审计表。
 
 ## 核心概念
 
@@ -1762,7 +1894,7 @@ app/
   review_packages.py # 离线审阅包：同读事务冻结快照/自动收录传递前置、离线决定整批校验、回传冲突检测与同写事务按依赖顺序应用、首次结果幂等重放
   release_candidates.py # 发布候选：同读事务固定版本/策略修订/门禁解释树/审阅状态/六类事件水位，初始门禁不过不落候选；确认时同写事务重读水位与门禁，冲突可定位且不改候选，水位未变且门禁通过才追加一次 released、重复确认幂等重放
   search.py     # 版本范围字面子串检索：码点字面匹配（保留重叠）、前后文片段、相交批注生效状态（确认范围优先）、四表快照水位与 HMAC 签名续页/续拉游标（纯函数 + 游标编解码）
-  db.py         # SQLite 连接、建表、读写事务
+  db.py         # SQLite 连接、读写事务、版本化迁移（schema_migrations 审计、旧库非破坏性预检、单步 SAVEPOINT 回滚与终态校验）
   schemas.py    # 请求体模型（含门禁策略、归档结构、核验请求、批量偏移换算与审阅包模型）
 tests/
   test_matching.py  # 匹配算法单元测试
@@ -1779,6 +1911,8 @@ tests/
   test_review_packages.py # 离线审阅包测试（同事务冻结/自动收录前置/离线整批校验/四类冲突不写入/依赖顺序应用/回滚/幂等重放/并发）
   test_release_candidates.py # 发布候选测试（同读事务冻结/初始门禁不过不落候选/六类水位与门禁复评冲突可定位/冲突不改候选/released 只写一次/幂等重放/跨文档隔离）
   test_search.py # 版本范围检索测试（重叠命中/emoji 码点偏移/四类相交状态/确认优先/100 分页稳定/并发版本与确认留到下一轮/续拉开新快照/游标篡改跨文档筛选不一致 422）
+  test_confirmation_migration.py # confirmations 唯一约束建库/旧库平滑迁移/重复确认拒绝
+  test_schema_migrations.py # 版本化迁移测试（新库顺序应用/旧库基线补登与只追加保留/索引与游标密钥补齐/重复确认预检拒绝/单步回滚与审计/终态校验/重试幂等/503 门禁）
 Dockerfile
 docker-compose.yml
 requirements.txt        # 运行依赖

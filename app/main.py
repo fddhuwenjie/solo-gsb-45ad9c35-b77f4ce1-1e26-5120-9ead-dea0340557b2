@@ -75,11 +75,13 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import archive as archive_mod
@@ -130,10 +132,45 @@ from .schemas import (
 )
 
 
+logger = logging.getLogger("app.main")
+
+# 让 app.db 的迁移 / 预检告警在容器日志中可见（uvicorn 默认只配置自身 logger）。
+if not logging.getLogger("app").handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger("app").addHandler(_h)
+    logging.getLogger("app").setLevel(
+        os.environ.get("LOG_LEVEL", "INFO").upper()
+    )
+
+# 迁移未成功完成（启动失败 / 被拒）时 not ready：除存活探针 / 就绪探针外，
+# 所有业务请求一律 503，不触达数据库。计数用于兼容测试中嵌套进入 / 退出
+# lifespan（TestClient 上下文管理器）：任一外层实例仍存活即保持就绪。
+_STATE: dict = {"ready": False, "lifespans": 0, "error": None}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.init_db()
-    yield
+    # init_db 在单个写事务内读取 schema 版本、顺序执行未完成迁移并审计；
+    # 预检致命错误 / 任一步失败 / 终态校验失败都会抛 MigrationError，
+    # 异常冒出 lifespan → uvicorn 退出，服务不监听、不接受任何业务请求。
+    try:
+        report = db.init_db()
+    except Exception as exc:
+        _STATE["error"] = str(exc)
+        raise
+    _STATE["lifespans"] += 1
+    _STATE["ready"] = True
+    logger.info(
+        "数据库就绪：schema_version=%d applied=%s legacy_stamped=%s",
+        report.version, report.applied, report.stamped,
+    )
+    try:
+        yield
+    finally:
+        _STATE["lifespans"] = max(0, _STATE["lifespans"] - 1)
+        if _STATE["lifespans"] == 0:
+            _STATE["ready"] = False
 
 
 app = FastAPI(
@@ -179,6 +216,25 @@ app = FastAPI(
 @app.exception_handler(sqlite3.IntegrityError)
 async def integrity_error_handler(request, exc):
     return JSONResponse(status_code=409, content={"detail": f"数据冲突：{exc}"})
+
+
+# 启动期迁移未完成时仅放行存活 / 就绪探针；其余请求（含文档页）在到达任何
+# 业务逻辑前 503，不触达数据库。
+_PROBE_PATHS = {"/health", "/readyz"}
+
+
+@app.middleware("http")
+async def require_migrated(request: Request, call_next):
+    if _STATE["ready"] or request.url.path in _PROBE_PATHS:
+        return await call_next(request)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "数据库版本迁移未完成或校验失败，服务暂不接受业务请求；"
+                      "请查看启动日志与 schema_migrations 审计表"
+        },
+        headers={"Retry-After": "30"},
+    )
 
 
 def get_db():
@@ -322,6 +378,30 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz():
+    """就绪探针：进程未完成启动迁移或终态校验失败时 503。"""
+    if not _STATE["ready"]:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ready": False,
+                "schema_version": db.SCHEMA_VERSION,
+                "applied_versions": [],
+                "failed": [],
+                "verify_error": _STATE.get("error") or "启动迁移尚未成功完成",
+            },
+        )
+    con = db.connect()
+    try:
+        info = db.readiness(con)
+    finally:
+        con.close()
+    if not info.pop("ready"):
+        return JSONResponse(status_code=503, content=info)
+    return info
 
 
 # ---------------------------------------------------------------------------
